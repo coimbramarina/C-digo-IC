@@ -1,0 +1,431 @@
+# 
+# SEÇÃO 1: INSTALAÇÃO E CARREGAMENTO DE PACOTES
+# 
+# Instale (se necessário) apenas uma vez:
+# install.packages("Benchmarking")
+# install.packages("igraph")
+# install.packages("ggraph")
+
+library(Benchmarking)  # Implementação de DEA e função peers()
+library(igraph)        # Para grafo de rede de referência
+library(ggraph)         # Visualização de redes com gramática do ggplot2
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(stringr)
+
+# 
+# SEÇÃO 2: PREPARAÇÃO DOS DADOS PARA DEA
+# 
+# Continuando a partir do seu df já carregado e tratado.
+# 
+# Para a DEA, precisamos definir:
+#   INPUTS  = recursos consumidos (infraestrutura aeroportuária)
+#   OUTPUTS = produtos/serviços gerados (operações aéreas)
+#
+# Escolha metodológica:
+#   - Orientação a OUTPUT: queremos saber quanto a DMU poderia expandir
+#     seus outputs mantendo os inputs fixos. É a abordagem mais comum
+#     em estudos de eficiência aeroportuária, pois a infraestrutura
+#     é rígida no curto prazo (não se amplia um terminal facilmente).
+#   - CRS (Constant Returns to Scale): assume que duplicar inputs duplica
+#     outputs. É o modelo mais conservador e o padrão da função dea().
+#     Alternativa: VRS (Variable Returns to Scale) com rts="vrs".
+
+# Definir inputs e outputs
+input_vars  &lt;- c("area_terminal", "portoes_embarque", 
+                 "w_estacionamentos", "capacidade_pista")
+output_vars &lt;- c("total_voos", "total_passageiros", "total_carga_kg")
+
+# Criar identificador único de DMU (aeroporto + ano)
+df_dea &lt;- df %>%
+  mutate(DMU = paste0(aeroporto, "_", ano)) %>%
+  select(DMU, aeroporto, ano, all_of(input_vars), all_of(output_vars))
+
+# 
+# SEÇÃO 3: TRATAMENTO DE VALORES AUSENTES
+# 
+# DEA exige que todas as DMUs tenham valores válidos para todos os
+# inputs e outputs. DMUs com NA em qualquer variável devem ser removidas,
+# pois a programação linear não consegue resolver com dados faltantes.
+# 
+# Alternativamente, poderíamos imputar (ex: média por aeroporto), mas
+# isso introduziria viés na fronteira de eficiência. A abordagem mais
+# rigorosa é remover observações incompletas.
+
+df_complete &lt;- df_dea %>%
+  drop_na(all_of(input_vars), all_of(output_vars)) %>%
+  mutate(DMU = paste0(aeroporto, "_", ano))
+
+cat("DMUs removidas por dados ausentes:", nrow(df_dea) - nrow(df_complete), "\n")
+cat("DMUs válidas para DEA:", nrow(df_complete), "\n")
+
+# Adicionar 0.0001 a variáveis que podem ter zero (ex: cp_internacional)
+# para evitar divisão por zero na normalização — já feito no seu código
+# original para as capacidades. Aqui garantimos que nenhum input é zero:
+for (v in input_vars) {
+  df_complete[[v]] &lt;- ifelse(df_complete[[v]] == 0, 0.0001, df_complete[[v]])
+}
+
+# 
+# SEÇÃO 4: CONSTRUÇÃO DAS MATRIZES DE INPUT E OUTPUT
+# 
+# O pacote Benchmarking exige que inputs e outputs sejam matrizes numéricas
+# onde cada LINHA é uma DMU e cada COLUNA é uma variável.
+
+x &lt;- as.matrix(df_complete[, input_vars])  # Matriz de inputs  (n × k)
+y &lt;- as.matrix(df_complete[, output_vars]) # Matriz de outputs (n × m)
+
+# Rótulos das DMUs para identificação nos gráficos
+dmu_names &lt;- df_complete$DMU
+rownames(x) &lt;- dmu_names
+rownames(y) &lt;- dmu_names
+
+cat("Dimensões da matriz de inputs: ", dim(x), "\n")
+cat("Dimensões da matriz de outputs:", dim(y), "\n")
+
+# 
+# SEÇÃO 5: EXECUÇÃO DO MODELO DEA
+# 
+# Modelo: DEA orientado a output, retornos constantes de escala (CRS)
+# 
+# Parâmetros da função dea():
+#   X        = matriz de inputs
+#   Y        = matriz de outputs
+#   ORIENTATION = "out"  (maximizar outputs dados os inputs)
+#   RTS      = "crs"     (Constant Returns to Scale)
+# 
+# A função retorna um objeto contendo:
+#   $eff    = scores de eficiência (θ). θ = 1 → eficiente; θ > 1 → ineficiente
+#   $lambda = matriz de pesos (n × n). λ_jk > 0 indica que DMU j é peer de k
+#   $peers  = lista de peers para cada DMU
+#   $lambda_val = valores de lambda correspondentes aos peers
+
+dea_result &lt;- dea(X = x, Y = y, 
+                  ORIENTATION = "out", 
+                  RTS = "crs")
+
+# Extrair scores de eficiência
+# No modelo orientado a output, eff = 1/θ. 
+# Se eff = 1 → DMU está na fronteira (eficiente)
+# Se eff &lt; 1 → DMU é ineficiente (pode expandir outputs)
+eff_scores &lt;- eff(dea_result)  # ou dea_result$eff
+
+# Resumo dos scores
+cat("\n=== RESUMO DOS SCORES DE EFICIÊNCIA ===\n")
+cat("Mínimo:   ", round(min(eff_scores), 4), "\n")
+cat("Máximo:   ", round(max(eff_scores), 4), "\n")
+cat("Média:    ", round(mean(eff_scores), 4), "\n")
+cat("Mediana:  ", round(median(eff_scores), 4), "\n")
+cat("DMUs eficientes (eff = 1):", sum(eff_scores == 1), "\n")
+cat("DMUs ineficientes (eff &lt; 1):", sum(eff_scores &lt; 1), "\n")
+
+# 
+# SEÇÃO 6: EXTRAÇÃO DOS PEERS
+# 
+# A função peers() retorna uma matriz onde:
+#   - Cada linha corresponde a uma DMU avaliada
+#   - As colunas contêm os ÍNDICES das DMUs que são seus peers
+#   - Valores 0 indicam ausência de peer adicional
+# 
+# A função lambda() retorna os pesos λ correspondentes aos peers.
+
+peers_matrix &lt;- peers(dea_result)      # Matriz de índices dos peers
+lambda_matrix &lt;- lambda(dea_result)     # Matriz de pesos λ (n × n completa)
+
+# Construir data frame estruturado: para cada DMU, listar seus peers e lambdas
+peers_list &lt;- list()
+
+for (i in 1:nrow(peers_matrix)) {
+  dmu_name &lt;- dmu_names[i]
+  peer_indices &lt;- peers_matrix[i, ]
+  peer_indices &lt;- peer_indices[peer_indices > 0]  # Remover zeros
+  
+  if (length(peer_indices) > 0) {
+    for (j in peer_indices) {
+      peers_list[[length(peers_list) + 1]] &lt;- data.frame(
+        DMU = dmu_name,
+        DMU_aeroporto = df_complete$aeroporto[i],
+        DMU_ano = df_complete$ano[i],
+        DMU_eff = round(eff_scores[i], 4),
+        Peer = dmu_names[j],
+        Peer_aeroporto = df_complete$aeroporto[j],
+        Peer_ano = df_complete$ano[j],
+        Lambda = round(dea_result$lambda[i, j], 4)
+      )
+    }
+  }
+}
+
+df_peers &lt;- bind_rows(peers_list)
+
+cat("\n=== ESTRUTURA DOS PEERS ===\n")
+cat("Total de relações DMU-Peer:", nrow(df_peers), "\n")
+cat("DMUs com pelo menos 1 peer:", length(unique(df_peers$DMU)), "\n")
+cat("Peers únicos (DMUs eficientes referenciadas):", 
+    length(unique(df_peers$Peer)), "\n")
+
+# 
+# SEÇÃO 7: GRÁFICO 1 — FREQUÊNCIA DE PEERS (BENCHMARKS MAIS REFERENCIADOS)
+# 
+# Este gráfico mostra quantas vezes cada DMU eficiente aparece como peer
+# para outras DMUs. Quanto maior a frequência, mais aquela DMU é um
+# "benchmark global" — ou seja, sua prática operacional é referência
+# para mais aeroportos.
+
+df_freq &lt;- df_peers %>%
+  group_by(Peer_aeroporto, Peer_ano) %>%
+  summarise(frequencia = n(), .groups = "drop") %>%
+  mutate(Peer_label = paste0(Peer_aeroporto, " (", Peer_ano, ")")) %>%
+  arrange(desc(frequencia))
+
+g1 &lt;- ggplot(df_freq, 
+             aes(x = reorder(Peer_label, frequencia), y = frequencia)) +
+  geom_col(fill = "steelblue", alpha = 0.8) +
+  geom_text(aes(label = frequencia), hjust = -0.3, size = 3.5) +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Frequência de Peers: DMUs Eficientes como Benchmark",
+       subtitle = "Quantas vezes cada DMU eficiente serve de referência para outras",
+       x = "DMU Peer (Aeroporto_Ano)",
+       y = "Frequência como Benchmark") +
+  theme(plot.title = element_text(face = "bold", size = 13))
+
+print(g1)
+
+# 
+# SEÇÃO 8: GRÁFICO 2 — REDE DE REFERÊNCIA (DMU → PEER)
+# 
+# Grafo direcionado onde:
+#   NÓS = DMUs (tanto ineficientes quanto eficientes)
+#   ARESTAS = ligação de DMU ineficiente → seu peer
+#   ESPESSURA da aresta = peso λ (quanto maior λ, mais forte a referência)
+#   COR do nó = eficiente (verde) vs ineficiente (vermelho)
+
+# Criar grafo direcionado
+edges &lt;- df_peers %>%
+  select(from = DMU, to = Peer, weight = Lambda) %>%
+  mutate(from = paste0(from),
+         to = paste0(to))
+
+grafo &lt;- graph_from_data_frame(edges, directed = TRUE)
+
+# Adicionar atributo de eficiência aos nós
+node_eff &lt;- data.frame(
+  name = dmu_names,
+  eficiencia = eff_scores,
+  aeroporto = df_complete$aeroporto,
+  ano = df_complete$ano
+) %>%
+  mutate(status = ifelse(eficiencia == 1, "Eficiente", "Ineficiente"))
+
+V(grafo)$status &lt;- node_eff$status[match(V(grafo)$name, node_eff$name)]
+V(grafo)$eficiencia &lt;- node_eff$eficiencia[match(V(grafo)$name, node_eff$name)]
+
+g2 &lt;- ggraph(grafo, layout = "fr") +
+  geom_edge_link(aes(width = weight, alpha = weight),
+                 arrow = arrow(length = unit(3, "mm")),
+                 color = "gray60", 
+                 end_cap = circle(4, "mm")) +
+  geom_node_point(aes(color = status, size = eficiencia)) +
+  geom_node_text(aes(label = name), repel = TRUE, size = 2.5) +
+  scale_color_manual(values = c("Eficiente" = "#2ecc71", 
+                                 "Ineficiente" = "#e74c3c")) +
+  scale_edge_width(range = c(0.3, 2)) +
+  theme_void() +
+  labs(title = "Rede de Referência DEA: DMUs e seus Peers",
+       subtitle = "Setas: DMU ineficiente → peer | Verde: eficiente | Vermelho: ineficiente",
+       color = "Status",
+       size = "Score de Eficiência") +
+  theme(legend.position = "right",
+        plot.title = element_text(face = "bold", size = 13))
+
+print(g2)
+
+# 
+# SEÇÃO 9: GRÁFICO 3 — PESOS LAMBDA POR DMU (HEATMAP)
+# 
+# O heatmap mostra, para cada DMU ineficiente (linhas), quais peers 
+# (colunas) compõem seu benchmark e com qual peso λ.
+# Isso revela a "receita" de eficiência: a combinação linear de DMUs
+# eficientes que forma o alvo de melhoria para cada DMU ineficiente.
+
+# Filtrar apenas DMUs ineficientes (que têm peers)
+inefficient_dmus &lt;- unique(df_peers$DMU)
+efficient_peers &lt;- unique(df_peers$Peer)
+
+# Submatriz lambda apenas com DMUs ineficientes e seus peers
+lambda_sub &lt;- dea_result$lambda[inefficient_dmus, efficient_peers, drop = FALSE]
+
+# Converter para data frame longo
+df_lambda_heat &lt;- as.data.frame(lambda_sub) %>%
+  mutate(DMU = rownames(.)) %>%
+  pivot_longer(-DMU, names_to = "Peer", values_to = "Lambda") %>%
+  filter(Lambda > 0) %>%
+  mutate(DMU = factor(DMU, levels = inefficient_dmus),
+         Peer = factor(Peer, levels = efficient_peers))
+
+g3 &lt;- ggplot(df_lambda_heat, aes(x = Peer, y = DMU, fill = Lambda)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = round(Lambda, 3)), size = 2.5, color = "black") +
+  scale_fill_gradient(low = "white", high = "darkblue", 
+                      name = "Peso λ") +
+  theme_minimal() +
+  labs(title = "Pesos Lambda: Composição do Benchmark para cada DMU",
+       subtitle = "Cada célula mostra o peso λ do peer na composição do benchmark",
+       x = "DMU Peer (Benchmark)",
+       y = "DMU Avaliada (Ineficiente)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+        axis.text.y = element_text(size = 8),
+        plot.title = element_text(face = "bold", size = 13))
+
+print(g3)
+
+# 
+# SEÇÃO 10: GRÁFICO 4 — SCORES DE EFICIÊNCIA COM PEERS DESTACADOS
+# 
+# Gráfico de barras horizontais mostrando o score de eficiência de cada DMU,
+# colorindo de verde as eficientes (peers) e de vermelho as ineficientes.
+
+df_eff &lt;- data.frame(
+  DMU = dmu_names,
+  aeroporto = df_complete$aeroporto,
+  ano = df_complete$ano,
+  eficiencia = eff_scores
+) %>%
+  mutate(status = ifelse(eficiencia == 1, "Eficiente (Peer)", "Ineficiente"),
+         label = paste0(aeroporto, " (", ano, ")"))
+
+g4 &lt;- ggplot(df_eff, 
+             aes(x = reorder(label, eficiencia), 
+                 y = eficiencia, fill = status)) +
+  geom_col() +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "gray40") +
+  coord_flip() +
+  scale_fill_manual(values = c("Eficiente (Peer)" = "#2ecc71", 
+                                "Ineficiente" = "#e74c3c")) +
+  theme_minimal() +
+  labs(title = "Scores de Eficiência DEA (Orientação a Output, CRS)",
+       subtitle = "Linha tracejada = fronteira de eficiência (θ = 1)",
+       x = "DMU (Aeroporto_Ano)",
+       y = "Score de Eficiência",
+       fill = "Status") +
+  theme(legend.position = "bottom",
+        plot.title = element_text(face = "bold", size = 13),
+        axis.text.y = element_text(size = 7))
+
+print(g4)
+
+# 
+# SEÇÃO 11: GRÁFICO 5 — NÚMERO DE PEERS POR DMU
+# 
+# Mostra quantos peers cada DMU ineficiente possui. 
+# Na DEA CRS, o número máximo de peers é igual a (inputs + outputs).
+# Com 4 inputs e 3 outputs, no máximo 7 peers por DMU.
+
+df_n_peers &lt;- df_peers %>%
+  group_by(DMU, DMU_aeroporto, DMU_ano, DMU_eff) %>%
+  summarise(n_peers = n(), .groups = "drop") %>%
+  mutate(label = paste0(DMU_aeroporto, " (", DMU_ano, ")"))
+
+g5 &lt;- ggplot(df_n_peers, 
+             aes(x = reorder(label, n_peers), y = n_peers, fill = DMU_eff)) +
+  geom_col() +
+  geom_text(aes(label = n_peers), vjust = -0.3, size = 3.5) +
+  coord_flip() +
+  scale_fill_gradient(low = "#e74c3c", high = "#f39c12", 
+                      name = "Score de\nEficiência") +
+  theme_minimal() +
+  labs(title = "Número de Peers por DMU Ineficiente",
+       subtitle = "Quantas DMUs eficientes compõem o benchmark de cada DMU",
+       x = "DMU (Aeroporto_Ano)",
+       y = "Número de Peers") +
+  theme(plot.title = element_text(face = "bold", size = 13),
+        axis.text.y = element_text(size = 8))
+
+print(g5)
+
+# 
+# SEÇÃO 12: GRÁFICO 6 — DISTRIBUIÇÃO DOS PESOS LAMBDA (BOXPLOT)
+# 
+# Para cada peer, mostra a distribuição dos pesos λ que recebe de todas
+# as DMUs que o referenciam. Isso identifica quais peers têm maior
+# influência média na composição dos benchmarks.
+
+g6 &lt;- ggplot(df_peers, 
+             aes(x = reorder(Peer_aeroporto, Lambda, FUN = median), 
+                 y = Lambda, fill = Peer_aeroporto)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.5, size = 1.5) +
+  theme_minimal() +
+  labs(title = "Distribuição dos Pesos Lambda por Peer",
+       subtitle = "Quais peers têm maior influência média nos benchmarks",
+       x = "Aeroporto Peer",
+       y = "Peso λ") +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", size = 13),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(g6)
+
+# 
+# SEÇÃO 13: GRÁFICO 7 — PROJEÇÃO NA FRONTIERA (2D)
+# 
+# Scatter plot mostrando a relação entre um input e um output,
+# destacando as DMUs eficientes (peers) que formam a fronteira.
+# 
+# Escolhemos area_terminal (input) vs total_passageiros (output) como
+# ilustração. A fronteira de eficiência é formada pelas DMUs eficientes.
+
+df_frontier &lt;- df_complete %>%
+  mutate(eficiencia = eff_scores,
+         status = ifelse(eficiencia == 1, "Eficiente (Peer)", "Ineficiente"))
+
+g7 &lt;- ggplot(df_frontier, 
+             aes(x = area_terminal, y = total_passageiros, 
+                 color = status, size = eficiencia)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(data = df_frontier %>% filter(status == "Eficiente (Peer)"),
+              method = "loess", se = FALSE, 
+              color = "gray50", linetype = "dashed", linewidth = 0.8) +
+  scale_color_manual(values = c("Eficiente (Peer)" = "#2ecc71", 
+                                 "Ineficiente" = "#e74c3c")) +
+  scale_x_log10() +
+  scale_y_log10() +
+  theme_minimal() +
+  labs(title = "Fronteira de Eficiência: Área Terminal vs Passageiros",
+       subtitle = "Escala logarítmica | Linha tracejada = fronteira estimada",
+       x = "Área Terminal (m²) [log]",
+       y = "Total de Passageiros [log]",
+       color = "Status",
+       size = "Eficiência") +
+  theme(legend.position = "right",
+        plot.title = element_text(face = "bold", size = 13))
+
+print(g7)
+
+# 
+# SEÇÃO 14: TABELA RESUMO DOS PEERS
+# 
+# Tabela estruturada com todas as relações DMU-Peer para inspeção
+
+cat("\n=== TABELA COMPLETA DE PEERS ===\n\n")
+print(df_peers %>%
+  select(DMU, DMU_eff, Peer, Lambda) %>%
+  arrange(DMU, desc(Lambda)) %>%
+  as.data.frame(), row.names = FALSE)
+
+# 
+# SEÇÃO 15: SALVAR GRÁFICOS EM ARQUIVO (OPCIONAL)
+# 
+# Para usar em relatórios ou artigos científicos:
+
+# ggsave("grafico_freq_peers.png", g1, width = 10, height = 6, dpi = 300)
+# ggsave("grafico_rede_peers.png", g2, width = 12, height = 10, dpi = 300)
+# ggsave("grafico_heatmap_lambda.png", g3, width = 10, height = 8, dpi = 300)
+# ggsave("grafico_scores_eficiencia.png", g4, width = 10, height = 8, dpi = 300)
+# ggsave("grafico_num_peers.png", g5, width = 10, height = 6, dpi = 300)
+# ggsave("grafico_boxplot_lambda.png", g6, width = 10, height = 6, dpi = 300)
+# ggsave("grafico_fronteira.png", g7, width = 10, height = 7, dpi = 300)
+
+cat("\n✅ TODOS OS 7 GRÁFICOS DE PEERS FORAM GERADOS!\n")
